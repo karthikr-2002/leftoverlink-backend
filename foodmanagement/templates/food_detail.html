@@ -1,0 +1,10 @@
+<h2>{{ food.name }}</h2>
+<p>{{ food.description }}</p>
+<p>Price: {{ food.price }}</p>
+<p>Available: {{ food.quantity }}</p>
+
+<form method="post" action="{% url 'add_to_cart' food.id %}">
+    {% csrf_token %}
+    <input type="number" name="quantity" min="1" max="{{ food.quantity }}" value="1">
+    <button type="submit">Add to Cart</button>
+</form>
