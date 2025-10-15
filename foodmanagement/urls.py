@@ -1,16 +1,22 @@
 from django.urls import path
 from .views import (
-    add_to_cart_api, remove_from_cart_api, get_cart_api, clear_cart_api,
+    get_foods_api, get_food_by_id_api, add_to_cart_api, remove_from_cart_api, get_cart_api, clear_cart_api,
     checkout_api, process_payment_api, get_wallet_api, add_money_to_wallet_api,
     get_orders_api, get_available_orders_api, assign_order_api, 
     update_delivery_status_api, collect_cod_payment_api, get_delivery_earnings_api,
     get_delivery_profile_api, update_delivery_profile_api, get_my_assigned_orders_api,
     submit_cod_payment_api, get_my_cod_submissions_api, get_pending_cod_submissions_api,
     verify_cod_submission_api, get_cod_verification_summary_api, get_financial_reports_api,
-    get_quick_reports_api, get_delivery_performance_api
+    get_quick_reports_api, get_delivery_performance_api, register_fcm_token_api,
+    unregister_fcm_token_api, send_test_notification_api, register_expo_push_token_api,
+    unregister_expo_push_token_api, send_local_notification_api
 )
 
 urlpatterns = [
+    # Food APIs
+    path('foods/', get_foods_api, name='get_foods'),
+    path('foods/<int:food_id>/', get_food_by_id_api, name='get_food_by_id'),
+    
     # Cart APIs
     path('food/<int:food_id>/add-to-cart/', add_to_cart_api, name='add_to_cart'),
     path('food/<int:food_id>/remove-from-cart/', remove_from_cart_api, name='remove_from_cart'),
@@ -49,4 +55,17 @@ urlpatterns = [
     path('admin/financial-reports/', get_financial_reports_api, name='get_financial_reports'),
     path('admin/quick-reports/', get_quick_reports_api, name='get_quick_reports'),
     path('admin/delivery-performance/', get_delivery_performance_api, name='get_delivery_performance'),
+    
+    # Local Notification APIs (works with Expo Go)
+    path('local-notification/', send_local_notification_api, name='send_local_notification'),
+    
+    # Expo Push Notification APIs
+    path('expo-push/register/', register_expo_push_token_api, name='register_expo_push_token'),
+    path('expo-push/unregister/', unregister_expo_push_token_api, name='unregister_expo_push_token'),
+    
+    # FCM Push Notification APIs
+    path('fcm/register/', register_fcm_token_api, name='register_fcm_token'),
+    path('fcm/unregister/', unregister_fcm_token_api, name='unregister_fcm_token'),
+    path('fcm/test/', send_test_notification_api, name='send_test_notification'),
+    
 ]

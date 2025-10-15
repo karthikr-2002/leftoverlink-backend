@@ -58,6 +58,7 @@ class OrderDetails(models.Model):
         ('confirmed', 'Confirmed'),
         ('preparing', 'Preparing'),
         ('out_for_delivery', 'Out for Delivery'),
+        ('ready_for_pickup', 'Ready for Pickup'),
         ('delivered', 'Delivered'),
         ('cancelled', 'Cancelled'),
     )
@@ -68,9 +69,12 @@ class OrderDetails(models.Model):
         ('cod', 'Cash on Delivery'),
     )
     
+    DELIVERY_TYPE_CHOICES = (
+        ('delivery', 'Delivery'),
+        ('takeaway', 'Take Away'),
+    )
+    
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="orders")
-    food = models.ForeignKey(Food, on_delete=models.SET_NULL, null=True)
-    quantity = models.PositiveIntegerField()
     ordered_at = models.DateTimeField(auto_now_add=True)
     delivered_by = models.ForeignKey(
         User,
@@ -96,6 +100,12 @@ class OrderDetails(models.Model):
         choices=PAYMENT_METHOD_CHOICES,
         default='cod'
     )
+    delivery_type = models.CharField(
+        max_length=10,
+        choices=DELIVERY_TYPE_CHOICES,
+        default='delivery'
+    )
+    subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     total_amount = models.DecimalField(max_digits=10, decimal_places=2)
     order_id = models.CharField(max_length=50, unique=True, blank=True)
     assigned_at = models.DateTimeField(null=True, blank=True)
@@ -113,6 +123,23 @@ class OrderDetails(models.Model):
         return f"Order {self.order_id} by {self.user.username} on {self.ordered_at}"
 
 
+class OrderItem(models.Model):
+    """Individual items within an order"""
+    order = models.ForeignKey(OrderDetails, on_delete=models.CASCADE, related_name="items")
+    food = models.ForeignKey(Food, on_delete=models.SET_NULL, null=True)
+    quantity = models.PositiveIntegerField()
+    price = models.DecimalField(max_digits=8, decimal_places=2)  # Price at time of order
+    total_price = models.DecimalField(max_digits=10, decimal_places=2)  # quantity * price
+    
+    def save(self, *args, **kwargs):
+        # Calculate total price
+        self.total_price = self.quantity * self.price
+        super().save(*args, **kwargs)
+    
+    def __str__(self):
+        return f"{self.food.name} x{self.quantity} in Order {self.order.order_id}"
+
+
 class Wallet(models.Model):
     TRANSACTION_TYPE_CHOICES = (
         ('credit', 'Credit'),
@@ -125,7 +152,7 @@ class Wallet(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     
     def __str__(self):
-        return f"Wallet for {self.user.username} - ${self.balance}"
+        return f"Wallet for {self.user.username} - ₹{self.balance}"
     
     def add_money(self, amount):
         """Add money to wallet"""
@@ -160,7 +187,7 @@ class WalletTransaction(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     
     def __str__(self):
-        return f"{self.transaction_type.title()} of ${self.amount} for {self.wallet.user.username}"
+        return f"{self.transaction_type.title()} of ₹{self.amount} for {self.wallet.user.username}"
 
 
 class DeliveryEarnings(models.Model):
@@ -180,7 +207,7 @@ class DeliveryEarnings(models.Model):
     paid_at = models.DateTimeField(null=True, blank=True)
     
     def __str__(self):
-        return f"{self.delivery_boy.username} - {self.earning_type} - ${self.amount}"
+        return f"{self.delivery_boy.username} - {self.earning_type} - ₹{self.amount}"
 
 
 class CODSubmission(models.Model):
@@ -210,7 +237,7 @@ class CODSubmission(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     
     def __str__(self):
-        return f"COD Submission - {self.delivery_boy.username} - Order {self.order.order_id} - ${self.amount_submitted}"
+        return f"COD Submission - {self.delivery_boy.username} - Order {self.order.order_id} - ₹{self.amount_submitted}"
 
 
 class DeliveryBoyProfile(models.Model):

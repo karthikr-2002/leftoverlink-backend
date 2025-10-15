@@ -1,0 +1,309 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static admin_modify %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{% url 'admin:foodmanagement_orderdetails_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+&rsaquo; <a href="{% url 'admin:financial_reports' %}">Financial Reports</a>
+&rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="module aligned">
+    <h1>{{ title }}</h1>
+    
+    <!-- Download PDF Button -->
+    <div style="margin: 20px 0; text-align: right;">
+        {% if report_type == 'daily' %}
+            <a href="{% url 'admin:daily_report_pdf' %}?date={{ date }}" class="pdf-button" target="_blank">
+                📄 Download PDF Report
+            </a>
+        {% elif report_type == 'weekly' %}
+            <a href="{% url 'admin:weekly_report_pdf' %}?week={{ week }}" class="pdf-button" target="_blank">
+                📄 Download PDF Report
+            </a>
+        {% elif report_type == 'monthly' %}
+            <a href="{% url 'admin:monthly_report_pdf' %}?month={{ month }}" class="pdf-button" target="_blank">
+                📄 Download PDF Report
+            </a>
+        {% elif report_type == 'custom' %}
+            <a href="{% url 'admin:custom_report_pdf' %}?start_date={{ start_date }}&end_date={{ end_date }}" class="pdf-button" target="_blank">
+                📄 Download PDF Report
+            </a>
+        {% endif %}
+    </div>
+    
+    <!-- Report Summary -->
+    <div class="results">
+        <h2>📊 Summary</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;">
+            <div class="summary-card">
+                <h3>Total Orders</h3>
+                <div class="amount">{{ data.summary.total_orders }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Total Revenue</h3>
+                <div class="amount">₹{{ data.summary.total_order_amount|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Platform Fee</h3>
+                <div class="amount">₹{{ data.summary.total_platform_fee|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Delivery Charges</h3>
+                <div class="amount">₹{{ data.summary.total_delivery_charge|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>COD Collected</h3>
+                <div class="amount">₹{{ data.summary.total_cod_collected|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Average Order Value</h3>
+                <div class="amount">₹{{ data.summary.average_order_value|floatformat:2 }}</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Payment Method Breakdown -->
+    <div class="module">
+        <h2>💳 Payment Method Breakdown</h2>
+        <table class="results">
+            <thead>
+                <tr>
+                    <th>Payment Method</th>
+                    <th>Orders</th>
+                    <th>Amount</th>
+                    <th>Percentage</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for method, method_data in data.payment_breakdown.items %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <td><strong>{{ method|upper }}</strong></td>
+                    <td>{{ method_data.count }}</td>
+                    <td>₹{{ method_data.amount|floatformat:2 }}</td>
+                    <td>
+                        {% if data.summary.total_order_amount > 0 %}
+                            {% widthratio method_data.amount data.summary.total_order_amount 100 %}%
+                        {% else %}
+                            0%
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <!-- Delivery Status Breakdown -->
+    <div class="module">
+        <h2>🚚 Delivery Status Breakdown</h2>
+        <table class="results">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Orders</th>
+                    <th>Amount</th>
+                    <th>Percentage</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for status, status_data in data.delivery_breakdown.items %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <td><strong>
+                        {% if status == "out_for_delivery" %}
+                            Out for Delivery
+                        {% elif status == "ready_for_pickup" %}
+                            Ready for Pickup
+                        {% else %}
+                            {{ status|title }}
+                        {% endif %}
+                    </strong></td>
+                    <td>{{ status_data.count }}</td>
+                    <td>₹{{ status_data.amount|floatformat:2 }}</td>
+                    <td>
+                        {% if data.summary.total_orders > 0 %}
+                            {% widthratio status_data.count data.summary.total_orders 100 %}%
+                        {% else %}
+                            0%
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    <!-- Daily Breakdown -->
+    {% if data.daily_breakdown %}
+    <div class="module">
+        <h2>📅 Daily Breakdown</h2>
+        <table class="results">
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Orders</th>
+                    <th>Revenue</th>
+                    <th>Platform Fee</th>
+                    <th>Delivery Charge</th>
+                    <th>COD Collected</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for day in data.daily_breakdown %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <td><strong>{{ day.date }}</strong></td>
+                    <td>{{ day.orders_count }}</td>
+                    <td>₹{{ day.total_amount|floatformat:2 }}</td>
+                    <td>₹{{ day.platform_fee|floatformat:2 }}</td>
+                    <td>₹{{ day.delivery_charge|floatformat:2 }}</td>
+                    <td>₹{{ day.cod_collected|floatformat:2 }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    
+    <!-- Top Delivery Boys -->
+    {% if data.top_delivery_boys %}
+    <div class="module">
+        <h2>🏆 Top Delivery Boys</h2>
+        <table class="results">
+            <thead>
+                <tr>
+                    <th>Delivery Boy</th>
+                    <th>Total Earnings</th>
+                    <th>Deliveries</th>
+                    <th>Average per Delivery</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for delivery_boy in data.top_delivery_boys %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <td><strong>{{ delivery_boy.delivery_boy__username }}</strong></td>
+                    <td>₹{{ delivery_boy.total_earnings|floatformat:2 }}</td>
+                    <td>{{ delivery_boy.delivery_count }}</td>
+                    <td>
+                        {% if delivery_boy.delivery_count > 0 %}
+                            ₹{% widthratio delivery_boy.total_earnings delivery_boy.delivery_count 1 %}
+                        {% else %}
+                            ₹0.00
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    
+    <!-- COD Information -->
+    <div class="module">
+        <h2>💰 COD Information</h2>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;">
+            <div class="summary-card">
+                <h3>COD Collected</h3>
+                <div class="amount">₹{{ data.summary.total_cod_collected|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>COD Submitted</h3>
+                <div class="amount">₹{{ data.summary.total_cod_submitted|floatformat:2 }}</div>
+            </div>
+            <div class="summary-card">
+                <h3>Pending COD</h3>
+                <div class="amount">₹{{ data.summary.pending_cod_amount|floatformat:2 }}</div>
+            </div>
+        </div>
+    </div>
+    
+    Navigation
+    <div class="module">
+        <h2>🔗 Navigation</h2>
+        <div style="margin: 20px 0;">
+            <a href="{% url 'admin:financial_reports' %}" class="addlink" style="margin-right: 10px;">
+                📊 Back to Reports Dashboard
+            </a>
+            <a href="{% url 'admin:foodmanagement_orderdetails_changelist' %}" class="addlink" style="margin-right: 10px;">
+                📋 View All Orders
+            </a>
+            <a href="{% url 'admin:foodmanagement_codsubmission_changelist' %}" class="addlink" style="margin-right: 10px;">
+                💰 COD Submissions
+            </a>
+        </div>
+    </div>
+</div>
+
+<style>
+.module {
+    margin-bottom: 20px;
+}
+.module h2 {
+    color: #2E7D32;
+    border-bottom: 2px solid #2E7D32;
+    padding-bottom: 5px;
+}
+.summary-card {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 5px;
+    text-align: center;
+    border-left: 4px solid #2E7D32;
+}
+.summary-card h3 {
+    margin: 0 0 10px 0;
+    color: #2E7D32;
+    font-size: 14px;
+}
+.summary-card .amount {
+    font-size: 24px;
+    font-weight: bold;
+    color: #333;
+}
+.addlink {
+    background: #2E7D32;
+    color: white;
+    padding: 8px 15px;
+    text-decoration: none;
+    border-radius: 4px;
+    display: inline-block;
+}
+.addlink:hover {
+    background: #1B5E20;
+    color: white;
+}
+.results table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.results th, .results td {
+    padding: 10px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+}
+.results th {
+    background: #f8f9fa;
+    font-weight: bold;
+}
+.pdf-button {
+    background: #d32f2f;
+    color: white;
+    padding: 10px 20px;
+    text-decoration: none;
+    border-radius: 4px;
+    display: inline-block;
+    font-weight: bold;
+    font-size: 14px;
+}
+.pdf-button:hover {
+    background: #c62828;
+    color: white;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+}
+</style>
+{% endblock %}

@@ -1,0 +1,199 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static admin_modify %}
+
+{% block title %}COD Submission Summary{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a>
+    &rsaquo; <a href="{% url 'admin:foodmanagement_codsubmission_changelist' %}">COD Submissions</a>
+    &rsaquo; Summary
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="module aligned">
+    <h1>COD Submission Summary</h1>
+    
+    <!-- Statistics Cards -->
+    <div class="results" style="display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap;">
+        <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #007cba; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #007cba;">Total Submissions</h3>
+            <div style="font-size: 24px; font-weight: bold;">{{ total_submissions }}</div>
+        </div>
+        
+        <div style="background: #fff3cd; padding: 20px; border-radius: 8px; border-left: 4px solid #ffc107; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #856404;">Pending Verification</h3>
+            <div style="font-size: 24px; font-weight: bold;">{{ pending_submissions }}</div>
+        </div>
+        
+        <div style="background: #d4edda; padding: 20px; border-radius: 8px; border-left: 4px solid #28a745; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #155724;">Verified</h3>
+            <div style="font-size: 24px; font-weight: bold;">{{ verified_submissions }}</div>
+        </div>
+        
+        <div style="background: #f8d7da; padding: 20px; border-radius: 8px; border-left: 4px solid #dc3545; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #721c24;">Rejected</h3>
+            <div style="font-size: 24px; font-weight: bold;">{{ rejected_submissions }}</div>
+        </div>
+    </div>
+    
+    <!-- Financial Summary -->
+    <div class="results" style="display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap;">
+        <div style="background: #e7f3ff; padding: 20px; border-radius: 8px; border-left: 4px solid #0066cc; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #0066cc;">Total Amount Submitted</h3>
+            <div style="font-size: 24px; font-weight: bold;">₹{{ total_amount_submitted|floatformat:2 }}</div>
+        </div>
+        
+        <div style="background: #e8f5e8; padding: 20px; border-radius: 8px; border-left: 4px solid #28a745; min-width: 200px;">
+            <h3 style="margin: 0 0 10px 0; color: #155724;">Total Amount Verified</h3>
+            <div style="font-size: 24px; font-weight: bold;">₹{{ total_amount_verified|floatformat:2 }}</div>
+        </div>
+    </div>
+    
+    <!-- Pending Submissions for Quick Action -->
+    {% if pending_for_verification %}
+    <div class="module">
+        <h2>Pending Verification ({{ pending_for_verification|length }})</h2>
+        <div class="results">
+            <table id="result_list">
+                <thead>
+                    <tr>
+                        <th>Delivery Boy</th>
+                        <th>Order ID</th>
+                        <th>Amount</th>
+                        <th>Method</th>
+                        <th>Submitted At</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for submission in pending_for_verification %}
+                    <tr class="{% cycle 'row1' 'row2' %}">
+                        <td>{{ submission.delivery_boy.username }}</td>
+                        <td>
+                            <a href="{% url 'admin:foodmanagement_orderdetails_change' submission.order.id %}">
+                                {{ submission.order.order_id }}
+                            </a>
+                        </td>
+                        <td>₹{{ submission.amount_submitted|floatformat:2 }}</td>
+                        <td>{{ submission.submission_method|title }}</td>
+                        <td>{{ submission.submitted_at|date:"M d, Y H:i" }}</td>
+                        <td>
+                            <a href="{% url 'admin:foodmanagement_codsubmission_change' submission.id %}" class="button">
+                                Review
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+    
+    <!-- Recent Submissions -->
+    <div class="module">
+        <h2>Recent Submissions</h2>
+        <div class="results">
+            <table id="result_list">
+                <thead>
+                    <tr>
+                        <th>Delivery Boy</th>
+                        <th>Order ID</th>
+                        <th>Amount</th>
+                        <th>Status</th>
+                        <th>Submitted At</th>
+                        <th>Verified By</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for submission in recent_submissions %}
+                    <tr class="{% cycle 'row1' 'row2' %}">
+                        <td>{{ submission.delivery_boy.username }}</td>
+                        <td>
+                            <a href="{% url 'admin:foodmanagement_orderdetails_change' submission.order.id %}">
+                                {{ submission.order.order_id }}
+                            </a>
+                        </td>
+                        <td>₹{{ submission.amount_submitted|floatformat:2 }}</td>
+                        <td>
+                            {% if submission.status == 'verified' %}
+                                <span style="color: green;">✅ Verified</span>
+                            {% elif submission.status == 'rejected' %}
+                                <span style="color: red;">❌ Rejected</span>
+                            {% elif submission.status == 'submitted' %}
+                                <span style="color: orange;">⏳ Pending</span>
+                            {% else %}
+                                <span style="color: blue;">📋 {{ submission.status|title }}</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ submission.submitted_at|date:"M d, Y H:i" }}</td>
+                        <td>
+                            {% if submission.verified_by %}
+                                {{ submission.verified_by.username }}
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Quick Actions -->
+    <div class="submit-row">
+        <a href="{% url 'admin:foodmanagement_codsubmission_changelist' %}" class="button">
+            View All COD Submissions
+        </a>
+        <a href="{% url 'admin:foodmanagement_orderdetails_changelist' %}?payment_method__exact=cod" class="button">
+            View COD Orders
+        </a>
+    </div>
+</div>
+
+<style>
+.results table {
+    width: 100%;
+    border-collapse: collapse;
+}
+.results th, .results td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+}
+.results th {
+    background-color: #f8f9fa;
+    font-weight: bold;
+}
+.row1 {
+    background-color: #fff;
+}
+.row2 {
+    background-color: #f8f9fa;
+}
+.button {
+    display: inline-block;
+    padding: 6px 12px;
+    background-color: #007cba;
+    color: white;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 12px;
+}
+.button:hover {
+    background-color: #005a87;
+    color: white;
+}
+.submit-row {
+    margin-top: 20px;
+    padding-top: 20px;
+    border-top: 1px solid #ddd;
+}
+.submit-row .button {
+    margin-right: 10px;
+}
+</style>
+{% endblock %}

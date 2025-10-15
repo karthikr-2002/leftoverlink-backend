@@ -1,6 +1,7 @@
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from foodmanagement.models import Food, Cart, OrderDetails, Wallet, WalletTransaction, DeliveryEarnings, DeliveryBoyProfile, CODSubmission
+from core.decimal_utils import to_decimal, to_float, safe_add, safe_subtract, safe_multiply, is_amount_equal
 
 
 def add_to_cart(user, food_id, quantity):
@@ -81,18 +82,16 @@ def calculate_cart_total(user, delivery_charge=0, platform_fee_percentage=5):
     Calculates the total amount for all items in user's cart.
     Returns a dictionary with subtotal, delivery_charge, platform_fee, and total.
     """
-    from decimal import Decimal
-    
     cart_items = get_user_cart(user)
-    subtotal = sum(item.quantity * item.food.price for item in cart_items)
-    platform_fee = (subtotal * Decimal(platform_fee_percentage)) / 100
-    total = subtotal + Decimal(delivery_charge) + platform_fee
+    subtotal = sum(safe_multiply(item.quantity, item.food.price) for item in cart_items)
+    platform_fee = safe_multiply(subtotal, to_decimal(platform_fee_percentage)) / to_decimal(100)
+    total = safe_add(subtotal, to_decimal(delivery_charge), platform_fee)
 
     return {
-        "subtotal": float(subtotal),
-        "delivery_charge": float(delivery_charge),
-        "platform_fee": float(platform_fee),
-        "total": float(total),
+        "subtotal": to_float(subtotal),
+        "delivery_charge": to_float(delivery_charge),
+        "platform_fee": to_float(platform_fee),
+        "total": to_float(total),
         "item_count": cart_items.count(),
     }
 
@@ -103,70 +102,76 @@ def process_wallet_payment(user, amount, description="Order payment"):
     Process payment using wallet.
     Returns True if successful, raises ValidationError if insufficient balance.
     """
-    from decimal import Decimal
-    
     wallet = get_or_create_wallet(user)
-    amount = Decimal(str(amount))
+    amount_decimal = to_decimal(amount)
 
-    if wallet.balance < amount:
+    if wallet.balance < amount_decimal:
         raise ValidationError("Insufficient wallet balance")
 
     # Deduct amount from wallet
-    wallet.deduct_money(amount)
+    wallet.deduct_money(amount_decimal)
 
     # Create transaction record
     WalletTransaction.objects.create(
-        wallet=wallet, amount=amount, transaction_type="debit", description=description
+        wallet=wallet, amount=amount_decimal, transaction_type="debit", description=description
     )
 
     return True
 
 
 @transaction.atomic
-def create_order_from_cart(user, payment_method, delivery_charge=0, platform_fee_percentage=5):
+def create_order_from_cart(user, payment_method, delivery_charge=0, platform_fee_percentage=5, delivery_type='delivery'):
     """
-    Creates OrderDetails from cart items and clears the cart.
-    Returns list of created orders.
+    Creates a single OrderDetails with multiple OrderItems from cart items and clears the cart.
+    Returns the created order.
     """
-    from decimal import Decimal
+    from foodmanagement.models import OrderItem
     
     cart_items = get_user_cart(user)
 
     if not cart_items.exists():
         raise ValidationError("Cart is empty")
 
-    orders = []
-    total_amount = Decimal('0')
-    subtotal = sum(item.quantity * item.food.price for item in cart_items)
-    platform_fee = (subtotal * Decimal(platform_fee_percentage)) / 100
+    # Calculate totals
+    subtotal = sum(safe_multiply(item.quantity, item.food.price) for item in cart_items)
+    platform_fee = safe_multiply(subtotal, to_decimal(platform_fee_percentage)) / to_decimal(100)
+    total_amount = safe_add(subtotal, to_decimal(delivery_charge), platform_fee)
 
+    # Check availability for all items first
     for cart_item in cart_items:
-        # Calculate item total
-        item_total = cart_item.quantity * cart_item.food.price
-        item_platform_fee = (item_total * Decimal(platform_fee_percentage)) / 100
+        if cart_item.food.quantity < cart_item.quantity:
+            raise ValidationError(f"Insufficient quantity for {cart_item.food.name}. Available: {cart_item.food.quantity}, Requested: {cart_item.quantity}")
 
-        # Create order
-        order = OrderDetails.objects.create(
-            user=user,
+    # Create the main order
+    order = OrderDetails.objects.create(
+        user=user,
+        subtotal=subtotal,
+        delivery_charge=to_decimal(delivery_charge),
+        platform_fee=platform_fee,
+        total_amount=total_amount,
+        payment_method=payment_method,
+        delivery_type=delivery_type,
+        payment_status="pending",  # All orders start as pending, COD gets paid when collected
+    )
+
+    # Create order items and reduce food quantities
+    for cart_item in cart_items:
+        # Create order item
+        OrderItem.objects.create(
+            order=order,
             food=cart_item.food,
             quantity=cart_item.quantity,
-            total_amount=item_total,
-            delivery_charge=(
-                Decimal(str(delivery_charge)) if cart_item == cart_items.first() else Decimal('0')
-            ),  # Only add delivery charge to first item
-            platform_fee=(
-                item_platform_fee if cart_item == cart_items.first() else Decimal('0')
-            ),  # Only add platform fee to first item
-            payment_method=payment_method,
-            payment_status="paid" if payment_method == "cod" else "pending",
+            price=cart_item.food.price,
         )
-        orders.append(order)
-        total_amount += item_total
+        
+        # Reduce food quantity
+        cart_item.food.quantity -= cart_item.quantity
+        cart_item.food.save()
 
     # Clear cart
     cart_items.delete()
-
-    return orders, total_amount
+    
+    return order
 
 
 def process_online_payment(user, amount, payment_data):
@@ -259,47 +264,83 @@ def collect_cod_payment(delivery_boy, order_id, amount_collected):
     Records COD payment collection by delivery boy.
     Creates delivery earnings record.
     """
+    import logging
     from django.utils import timezone
-    from decimal import Decimal
+    
+    logger = logging.getLogger(__name__)
     
     try:
+        logger.info(f"Starting COD collection for order {order_id}, amount: {amount_collected}, type: {type(amount_collected)}")
+        
         order = OrderDetails.objects.get(
             id=order_id, 
             delivered_by=delivery_boy,
             payment_method='cod'
         )
+        logger.info(f"Order found: {order.order_id}")
     except OrderDetails.DoesNotExist:
+        logger.error(f"Order {order_id} not found for delivery boy {delivery_boy.username}")
         raise ValidationError("Order not found or not assigned to you.")
     
     if order.cod_amount_collected > 0:
+        logger.warning(f"COD already collected for order {order.order_id}")
         raise ValidationError("COD amount already collected for this order.")
     
-    amount_collected = Decimal(str(amount_collected))
-    expected_amount = order.total_amount + order.delivery_charge + order.platform_fee
-    if amount_collected != expected_amount:
-        raise ValidationError(f"Amount mismatch. Expected: ${expected_amount}, Received: ${amount_collected}")
+    # Convert amount_collected to Decimal using centralized utility
+    amount_collected_decimal = to_decimal(amount_collected)
+    logger.info(f"Amount converted to Decimal: {amount_collected_decimal}, type: {type(amount_collected_decimal)}")
+    
+    # The expected amount is just the total_amount (which already includes delivery charge and platform fee)
+    expected_amount = order.total_amount
+    logger.info(f"Expected amount: {expected_amount}, type: {type(expected_amount)}")
+    
+    # Check amount match with tolerance for floating point precision
+    if not is_amount_equal(amount_collected_decimal, expected_amount):
+        logger.error(f"Amount mismatch. Expected: {expected_amount}, Received: {amount_collected_decimal}")
+        raise ValidationError(f"Amount mismatch. Expected: ${expected_amount}, Received: ${amount_collected_decimal}")
     
     # Update order with COD collection
-    order.cod_amount_collected = amount_collected
+    order.cod_amount_collected = amount_collected_decimal
     order.cod_collected_at = timezone.now()
     order.payment_status = 'paid'
     order.save()
+    logger.info(f"Order updated with COD collection: {amount_collected_decimal}")
     
     # Create delivery earnings for delivery charge
-    if order.delivery_charge > 0:
+    delivery_charge_decimal = to_decimal(order.delivery_charge)
+    logger.info(f"Delivery charge converted: {delivery_charge_decimal}, type: {type(delivery_charge_decimal)}")
+    
+    if delivery_charge_decimal > 0:
         DeliveryEarnings.objects.create(
             delivery_boy=delivery_boy,
             order=order,
-            amount=order.delivery_charge,
+            amount=delivery_charge_decimal,
             earning_type='delivery_charge',
             description=f'Delivery charge for order {order.order_id}'
         )
+        logger.info(f"Delivery earnings created: {delivery_charge_decimal}")
     
-    # Update delivery boy profile
+    # Update delivery boy profile using safe conversion
     profile = get_or_create_delivery_profile(delivery_boy)
-    profile.total_earnings += float(order.delivery_charge)
+    logger.info(f"Profile found/created. Current total_earnings: {profile.total_earnings}, type: {type(profile.total_earnings)}")
+    
+    # Keep everything as Decimal for database consistency
+    current_earnings_decimal = to_decimal(profile.total_earnings)
+    logger.info(f"Current earnings as Decimal: {current_earnings_decimal}, type: {type(current_earnings_decimal)}")
+    
+    try:
+        # Use Decimal arithmetic for database field
+        profile.total_earnings = safe_add(current_earnings_decimal, delivery_charge_decimal)
+        logger.info(f"Profile total_earnings updated to: {profile.total_earnings}, type: {type(profile.total_earnings)}")
+    except Exception as e:
+        logger.error(f"Error updating profile total_earnings: {e}")
+        logger.error(f"current_earnings_decimal type: {type(current_earnings_decimal)}")
+        logger.error(f"delivery_charge_decimal type: {type(delivery_charge_decimal)}")
+        raise
+    
     profile.total_deliveries += 1
     profile.save()
+    logger.info(f"Profile saved successfully")
     
     return order
 
@@ -310,8 +351,8 @@ def get_delivery_boy_earnings(delivery_boy):
     Returns earnings summary.
     """
     earnings = DeliveryEarnings.objects.filter(delivery_boy=delivery_boy)
-    total_earnings = sum(float(earning.amount) for earning in earnings)
-    paid_earnings = sum(float(earning.amount) for earning in earnings if earning.is_paid)
+    total_earnings = sum(to_float(earning.amount) for earning in earnings)
+    paid_earnings = sum(to_float(earning.amount) for earning in earnings if earning.is_paid)
     pending_earnings = total_earnings - paid_earnings
     
     return {
@@ -322,7 +363,7 @@ def get_delivery_boy_earnings(delivery_boy):
         'earnings_breakdown': [
             {
                 'order_id': earning.order.order_id,
-                'amount': float(earning.amount),
+                'amount': to_float(earning.amount),
                 'type': earning.earning_type,
                 'description': earning.description,
                 'date': earning.created_at,
@@ -340,7 +381,6 @@ def submit_cod_payment(delivery_boy, order_id, amount_submitted, submission_meth
     Returns the COD submission record.
     """
     from django.utils import timezone
-    from decimal import Decimal
     
     try:
         order = OrderDetails.objects.get(
@@ -364,17 +404,17 @@ def submit_cod_payment(delivery_boy, order_id, amount_submitted, submission_meth
     if existing_submission:
         raise ValidationError("COD payment already submitted for this order.")
     
-    amount_submitted = Decimal(str(amount_submitted))
-    expected_amount = order.cod_amount_collected
+    amount_submitted_decimal = to_decimal(amount_submitted)
+    expected_amount = to_decimal(order.cod_amount_collected)
     
-    if amount_submitted != expected_amount:
-        raise ValidationError(f"Amount mismatch. Expected: ${expected_amount}, Submitted: ${amount_submitted}")
+    if not is_amount_equal(amount_submitted_decimal, expected_amount):
+        raise ValidationError(f"Amount mismatch. Expected: ${expected_amount}, Submitted: ${amount_submitted_decimal}")
     
     # Create COD submission
     submission = CODSubmission.objects.create(
         delivery_boy=delivery_boy,
         order=order,
-        amount_submitted=amount_submitted,
+        amount_submitted=amount_submitted_decimal,
         submission_method=submission_method,
         submission_notes=notes,
         status='submitted',
@@ -391,7 +431,7 @@ def get_cod_submissions(delivery_boy):
     """
     submissions = CODSubmission.objects.filter(delivery_boy=delivery_boy).order_by('-created_at')
     
-    total_submitted = sum(float(sub.amount_submitted) for sub in submissions)
+    total_submitted = sum(to_float(sub.amount_submitted) for sub in submissions)
     pending_submissions = submissions.filter(status='pending').count()
     submitted_submissions = submissions.filter(status='submitted').count()
     verified_submissions = submissions.filter(status='verified').count()
@@ -407,7 +447,7 @@ def get_cod_submissions(delivery_boy):
             {
                 'id': sub.id,
                 'order_id': sub.order.order_id,
-                'amount_submitted': float(sub.amount_submitted),
+                'amount_submitted': to_float(sub.amount_submitted),
                 'submission_method': sub.submission_method,
                 'status': sub.status,
                 'submitted_at': sub.submitted_at,

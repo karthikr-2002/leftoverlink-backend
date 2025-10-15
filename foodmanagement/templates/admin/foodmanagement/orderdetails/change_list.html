@@ -1,0 +1,23 @@
+{% extends "admin/change_list.html" %}
+{% load i18n admin_urls static admin_modify %}
+
+{% block object-tools-items %}
+    {{ block.super }}
+    {% if show_reports_link %}
+    <li>
+        <a href="{% url 'admin:financial_reports' %}" class="addlink" style="background: #2E7D32; color: white; padding: 8px 15px; text-decoration: none; border-radius: 4px;">
+            📊 Financial Reports
+        </a>
+    </li>
+    {% endif %}
+{% endblock %}
+
+{% block content %}
+    <div style="background: #e8f5e8; border: 1px solid #2E7D32; padding: 10px; margin-bottom: 20px; border-radius: 4px;">
+        <strong>📊 Financial Reports Available:</strong> 
+        <a href="{% url 'admin:financial_reports' %}" style="color: #2E7D32; text-decoration: underline; margin-left: 10px;">
+            View Daily, Weekly & Monthly Reports
+        </a>
+    </div>
+    {{ block.super }}
+{% endblock %}

@@ -14,14 +14,24 @@ from core.helpers import (
     get_cod_submissions, get_pending_cod_submissions,
     verify_cod_submission, get_financial_reports
 )
-from foodmanagement.models import Cart, OrderDetails, Wallet, WalletTransaction, DeliveryEarnings, DeliveryBoyProfile, CODSubmission
+from core.fcm_service_v1 import fcm_service_v1
+from foodmanagement.models import Food, Cart, OrderDetails, Wallet, WalletTransaction, DeliveryEarnings, DeliveryBoyProfile, CODSubmission
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 from decimal import Decimal
+from core.decimal_utils import to_decimal, to_float, convert_model_amounts_to_float
 
+
+class FoodSerializer(serializers.ModelSerializer):
+    price = serializers.DecimalField(max_digits=8, decimal_places=2, coerce_to_string=False)
+    
+    class Meta:
+        model = Food
+        fields = ['id', 'name', 'description', 'price', 'quantity', 'status', 'created_at', 'updated_at']
 
 class CartSerializer(serializers.ModelSerializer):
     food_name = serializers.CharField(source='food.name', read_only=True)
-    food_price = serializers.DecimalField(source='food.price', max_digits=8, decimal_places=2, read_only=True)
+    food_price = serializers.DecimalField(source='food.price', max_digits=8, decimal_places=2, read_only=True, coerce_to_string=False)
     total_price = serializers.SerializerMethodField()
     
     class Meta:
@@ -29,7 +39,33 @@ class CartSerializer(serializers.ModelSerializer):
         fields = ['id', 'food', 'food_name', 'food_price', 'quantity', 'total_price', 'added_at']
     
     def get_total_price(self, obj):
-        return obj.quantity * obj.food.price
+        return float(obj.quantity * obj.food.price)
+
+# ==================== FOOD APIs ====================
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def get_foods_api(request):
+    """Get list of all available foods with quantity > 0"""
+    foods = Food.objects.filter(status='available', quantity__gt=0).order_by('-created_at')
+    serializer = FoodSerializer(foods, many=True)
+    return Response({
+        "foods": serializer.data,
+        "total_foods": foods.count()
+    }, status=status.HTTP_200_OK)
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def get_food_by_id_api(request, food_id):
+    """Get specific food details by ID"""
+    try:
+        food = Food.objects.get(id=food_id, status='available')
+        serializer = FoodSerializer(food)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    except Food.DoesNotExist:
+        return Response({"detail": "Food not found or not available"}, status=status.HTTP_404_NOT_FOUND)
 
 @api_view(['POST'])
 @authentication_classes([JWTAuthentication])
@@ -75,7 +111,7 @@ def get_cart_api(request):
     return Response({
         "cart_items": serializer.data,
         "total_items": cart_items.count(),
-        "total_value": total_value
+        "total_value": float(total_value)
     }, status=status.HTTP_200_OK)
 
 
@@ -99,12 +135,28 @@ def clear_cart_api(request):
 def checkout_api(request):
     """Get checkout summary with total amount and payment options"""
     from decimal import Decimal
+    from core.location_utils import calculate_delivery_charge, validate_coordinates
     
-    delivery_charge = float(request.GET.get('delivery_charge', 0))
+    # Get delivery type and location parameters
+    delivery_type = request.GET.get('delivery_type', 'delivery')
+    user_lat = request.GET.get('latitude')
+    user_lon = request.GET.get('longitude')
+    
+    # Calculate delivery charge based on location if delivery type is 'delivery'
+    if delivery_type == 'delivery':
+        if user_lat and user_lon and validate_coordinates(user_lat, user_lon):
+            delivery_charge = calculate_delivery_charge(user_lat, user_lon)
+        else:
+            # No delivery charge if no valid coordinates provided
+            delivery_charge = Decimal('0')
+    else:
+        # No delivery charge for takeaway
+        delivery_charge = Decimal('0')
+    
     platform_fee_percentage = float(request.GET.get('platform_fee_percentage', 5))
     
     # Calculate cart total
-    cart_summary = calculate_cart_total(request.user, delivery_charge, platform_fee_percentage)
+    cart_summary = calculate_cart_total(request.user, float(delivery_charge), platform_fee_percentage)
     
     # Get user's wallet balance
     wallet = get_or_create_wallet(request.user)
@@ -112,6 +164,8 @@ def checkout_api(request):
     return Response({
         "cart_summary": cart_summary,
         "wallet_balance": float(wallet.balance),
+        "delivery_charge": float(delivery_charge),
+        "delivery_type": delivery_type,
         "payment_methods": [
             {"value": "wallet", "label": "Wallet"},
             {"value": "online", "label": "Online Payment"},
@@ -128,6 +182,7 @@ def process_payment_api(request):
     from decimal import Decimal
     
     payment_method = request.data.get('payment_method')
+    delivery_type = request.data.get('delivery_type', 'delivery')
     delivery_charge = float(request.data.get('delivery_charge', 0))
     platform_fee_percentage = float(request.data.get('platform_fee_percentage', 5))
     
@@ -139,9 +194,15 @@ def process_payment_api(request):
         cart_summary = calculate_cart_total(request.user, delivery_charge, platform_fee_percentage)
         total_amount = cart_summary['total']
         
+        # Create order from cart (starts as pending)
+        order = create_order_from_cart(request.user, payment_method, delivery_charge, platform_fee_percentage, delivery_type)
+        
+        # Process payment based on method
         if payment_method == 'wallet':
-            # Process wallet payment
+            # Process wallet payment and update order status
             process_wallet_payment(request.user, total_amount, "Order payment")
+            order.payment_status = 'paid'
+            order.save()
             
         elif payment_method == 'online':
             # Process online payment
@@ -149,17 +210,21 @@ def process_payment_api(request):
             payment_result = process_online_payment(request.user, total_amount, payment_data)
             
             if not payment_result['success']:
+                order.payment_status = 'failed'
+                order.save()
                 return Response({"detail": "Payment failed"}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                order.payment_status = 'paid'
+                order.save()
         
-        # Create orders from cart
-        orders, order_total = create_order_from_cart(request.user, payment_method, delivery_charge, platform_fee_percentage)
+        # For COD, order remains pending until delivery boy collects payment
         
         return Response({
             "detail": "Order placed successfully!",
-            "orders": [order.order_id for order in orders],
-            "total_amount": float(order_total),
+            "order_id": order.order_id,
+            "total_amount": float(order.total_amount),
             "payment_method": payment_method,
-            "payment_status": "paid" if payment_method == 'cod' else "pending"
+            "payment_status": "paid" if payment_method in ['wallet', 'online'] else "pending"
         }, status=status.HTTP_201_CREATED)
         
     except ValidationError as e:
@@ -205,7 +270,7 @@ def add_money_to_wallet_api(request):
         )
         
         return Response({
-            "detail": f"${amount} added to wallet successfully!",
+            "detail": f"₹{amount} added to wallet successfully!",
             "new_balance": float(wallet.balance)
         }, status=status.HTTP_200_OK)
         
@@ -222,13 +287,25 @@ def get_orders_api(request):
     
     order_data = []
     for order in orders:
+        # Get all items in this order
+        items = []
+        for item in order.items.all():
+            items.append({
+                'food_name': item.food.name if item.food else 'Item no longer available',
+                'quantity': item.quantity,
+                'price': float(item.price),
+                'total_price': float(item.total_price)
+            })
+        
         order_data.append({
             'order_id': order.order_id,
-            'food_name': order.food.name if order.food else 'Item no longer available',
-            'quantity': order.quantity,
-            'total_amount': float(order.total_amount),
+            'items': items,
+            'subtotal': float(order.subtotal),
             'delivery_charge': float(order.delivery_charge),
+            'platform_fee': float(order.platform_fee),
+            'total_amount': float(order.total_amount),
             'payment_method': order.payment_method,
+            'delivery_type': order.delivery_type,
             'payment_status': order.payment_status,
             'delivery_status': order.delivery_status,
             'ordered_at': order.ordered_at,
@@ -256,16 +333,27 @@ def get_available_orders_api(request):
     
     order_data = []
     for order in orders:
+        # Get all items in this order
+        items = []
+        for item in order.items.all():
+            items.append({
+                'food_name': item.food.name if item.food else 'Item no longer available',
+                'quantity': item.quantity,
+                'price': float(item.price),
+                'total_price': float(item.total_price)
+            })
+        
         order_data.append({
             'id': order.id,
             'order_id': order.order_id,
             'customer_name': order.user.username,
-            'food_name': order.food.name if order.food else 'Item no longer available',
-            'quantity': order.quantity,
+            'items': items,
+            'subtotal': float(order.subtotal),
             'total_amount': float(order.total_amount),
             'delivery_charge': float(order.delivery_charge),
             'platform_fee': float(order.platform_fee),
             'payment_method': order.payment_method,
+            'delivery_type': order.delivery_type,
             'delivery_status': order.delivery_status,
             'ordered_at': order.ordered_at,
             'address': getattr(order.user, 'address', 'Address not provided')
@@ -293,14 +381,24 @@ def assign_order_api(request):
     try:
         order = assign_order_to_delivery_boy(request.user, order_id)
         
+        # Get all items in this order
+        items = []
+        for item in order.items.all():
+            items.append({
+                'food_name': item.food.name if item.food else 'Item no longer available',
+                'quantity': item.quantity,
+                'price': float(item.price),
+                'total_price': float(item.total_price)
+            })
+        
         return Response({
             "detail": f"Order {order.order_id} assigned successfully!",
             "order": {
                 'id': order.id,
                 'order_id': order.order_id,
                 'customer_name': order.user.username,
-                'food_name': order.food.name if order.food else 'Item no longer available',
-                'quantity': order.quantity,
+                'items': items,
+                'subtotal': float(order.subtotal),
                 'total_amount': float(order.total_amount),
                 'delivery_charge': float(order.delivery_charge),
                 'platform_fee': float(order.platform_fee),
@@ -332,12 +430,32 @@ def update_delivery_status_api(request):
     try:
         order = update_delivery_status(request.user, order_id, new_status)
         
+        # Get order items
+        order_items = order.items.all()
+        items_data = []
+        for item in order_items:
+            items_data.append({
+                'id': item.id,
+                'food_name': item.food.name,
+                'quantity': item.quantity,
+                'price': to_float(item.price),
+                'total_price': to_float(item.total_price)
+            })
+        
         return Response({
             "detail": f"Order status updated to {new_status}",
             "order": {
                 'id': order.id,
                 'order_id': order.order_id,
                 'delivery_status': order.delivery_status,
+                'delivery_type': order.delivery_type,
+                'total_amount': to_float(order.total_amount),
+                'delivery_charge': to_float(order.delivery_charge),
+                'platform_fee': to_float(order.platform_fee),
+                'payment_method': order.payment_method,
+                'payment_status': order.payment_status,
+                'cod_amount_collected': to_float(order.cod_amount_collected),
+                'items': items_data,
                 'updated_at': order.assigned_at
             }
         }, status=status.HTTP_200_OK)
@@ -351,34 +469,51 @@ def update_delivery_status_api(request):
 @permission_classes([IsAuthenticated])
 def collect_cod_payment_api(request):
     """Collect COD payment from customer"""
+    import logging
     from decimal import Decimal
+    
+    logger = logging.getLogger(__name__)
     
     # Check if user is a delivery boy
     if request.user.user_type != 'delivery':
         return Response({"detail": "Access denied. Only delivery boys can collect payments."}, status=status.HTTP_403_FORBIDDEN)
     
     order_id = request.data.get('order_id')
-    amount_collected = Decimal(str(request.data.get('amount_collected', 0)))
+    raw_amount = request.data.get('amount_collected', 0)
+    
+    logger.info(f"API received - order_id: {order_id}, raw_amount: {raw_amount}, type: {type(raw_amount)}")
+    
+    # Use centralized utility instead of direct Decimal conversion
+    amount_collected = to_decimal(raw_amount)
+    logger.info(f"Amount converted using to_decimal: {amount_collected}, type: {type(amount_collected)}")
     
     if not order_id or amount_collected <= 0:
         return Response({"detail": "Order ID and valid amount are required"}, status=status.HTTP_400_BAD_REQUEST)
     
     try:
+        logger.info(f"Calling collect_cod_payment with order_id: {order_id}, amount: {amount_collected}")
         order = collect_cod_payment(request.user, order_id, amount_collected)
         
         return Response({
-            "detail": f"COD payment of ${amount_collected} collected successfully!",
+            "detail": f"COD payment of ₹{amount_collected} collected successfully!",
             "order": {
                 'id': order.id,
                 'order_id': order.order_id,
-                'amount_collected': float(order.cod_amount_collected),
+                'amount_collected': to_float(order.cod_amount_collected),
                 'collected_at': order.cod_collected_at,
                 'payment_status': order.payment_status
             }
         }, status=status.HTTP_200_OK)
         
     except ValidationError as e:
+        logger.error(f"Validation error in collect_cod_payment_api: {e}")
         return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"Unexpected error in collect_cod_payment_api: {e}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return Response({"detail": f"Error collecting COD: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
@@ -412,25 +547,50 @@ def get_my_assigned_orders_api(request):
     
     order_data = []
     for order in assigned_orders:
-        order_data.append({
+        # Check COD submission status
+        cod_submission_status = None
+        if order.payment_method == 'cod' and order.cod_amount_collected > 0:
+            cod_submission = order.cod_submissions.filter(
+                delivery_boy=request.user
+            ).first()
+            if cod_submission:
+                cod_submission_status = cod_submission.status
+        
+        # Get all items in this order
+        items = []
+        for item in order.items.all():
+            items.append({
+                'food_name': item.food.name if item.food else 'Item no longer available',
+                'quantity': item.quantity,
+                'price': float(item.price),
+                'total_price': float(item.total_price)
+            })
+        
+        # Convert order data using centralized utilities
+        order_dict = {
             'id': order.id,
             'order_id': order.order_id,
             'customer_name': order.user.username,
-            'food_name': order.food.name if order.food else 'Item no longer available',
-            'quantity': order.quantity,
-            'total_amount': float(order.total_amount),
-            'delivery_charge': float(order.delivery_charge),
-            'platform_fee': float(order.platform_fee),
+            'items': items,
+            'subtotal': order.subtotal,
+            'total_amount': order.total_amount,
+            'delivery_charge': order.delivery_charge,
+            'platform_fee': order.platform_fee,
             'payment_method': order.payment_method,
+            'delivery_type': order.delivery_type,
             'payment_status': order.payment_status,
             'delivery_status': order.delivery_status,
             'ordered_at': order.ordered_at,
             'assigned_at': order.assigned_at,
-            'cod_amount_collected': float(order.cod_amount_collected) if order.cod_amount_collected else 0,
+            'cod_amount_collected': order.cod_amount_collected,
             'cod_collected_at': order.cod_collected_at,
+            'cod_submission_status': cod_submission_status,
             'address': getattr(order.user, 'address', 'Address not provided'),
             'customer_phone': getattr(order.user, 'phone_number', 'Phone not provided')
-        })
+        }
+        
+        # Convert amount fields to float for API response
+        order_data.append(convert_model_amounts_to_float(order_dict))
     
     return Response({
         "assigned_orders": order_data,
@@ -530,7 +690,7 @@ def submit_cod_payment_api(request):
         )
         
         return Response({
-            "detail": f"COD payment of ${amount_submitted} submitted successfully!",
+            "detail": f"COD payment of ₹{amount_submitted} submitted successfully!",
             "submission": {
                 'id': submission.id,
                 'order_id': submission.order.order_id,
@@ -815,3 +975,194 @@ def get_delivery_performance_api(request):
         },
         'performance_data': performance_data
     }, status=status.HTTP_200_OK)
+
+
+# ==================== EXPO PUSH NOTIFICATION APIs ====================
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def register_expo_push_token_api(request):
+    """Register Expo push token for push notifications"""
+    expo_push_token = request.data.get('expo_push_token')
+    device_type = request.data.get('device_type', 'android')
+    
+    if not expo_push_token:
+        return Response({"detail": "Expo push token is required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        device = fcm_service_v1.register_device(
+            user_id=request.user.id,
+            fcm_token=expo_push_token,
+            device_type=device_type
+        )
+        
+        if device:
+            return Response({
+                "detail": "Expo push token registered successfully",
+                "device_id": device.id
+            }, status=status.HTTP_201_CREATED)
+        else:
+            return Response({
+                "detail": "Failed to register token"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    except Exception as e:
+        return Response({
+            "detail": f"Error registering token: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def unregister_expo_push_token_api(request):
+    """Unregister Expo push token"""
+    expo_push_token = request.data.get('expo_push_token')
+    
+    if not expo_push_token:
+        return Response({"detail": "Expo push token is required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        device = fcm_service_v1.deactivate_device(expo_push_token)
+        
+        return Response({
+            "detail": "Expo push token unregistered successfully"
+        }, status=status.HTTP_200_OK)
+        
+    except FCMDevice.DoesNotExist:
+        return Response({
+            "detail": "Expo push token not found"
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        return Response({
+            "detail": f"Error unregistering token: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+# ==================== FCM PUSH NOTIFICATION APIs ====================
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def register_fcm_token_api(request):
+    """Register FCM token for push notifications"""
+    fcm_token = request.data.get('fcm_token')
+    device_type = request.data.get('device_type', 'android')
+    
+    if not fcm_token:
+        return Response({"detail": "FCM token is required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        device = fcm_service_v1.register_device(
+            user_id=request.user.id,
+            fcm_token=fcm_token,
+            device_type=device_type
+        )
+        
+        if device:
+            return Response({
+                "detail": "FCM token registered successfully",
+                "device_id": device.id
+            }, status=status.HTTP_201_CREATED)
+        else:
+            return Response({
+                "detail": "Failed to register FCM token"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    except Exception as e:
+        return Response({
+            "detail": f"Error registering token: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def unregister_fcm_token_api(request):
+    """Unregister FCM token"""
+    fcm_token = request.data.get('fcm_token')
+    
+    if not fcm_token:
+        return Response({"detail": "FCM token is required"}, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        device = fcm_service_v1.deactivate_device(fcm_token)
+        
+        if device:
+            return Response({
+                "detail": "FCM token unregistered successfully"
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                "detail": "FCM token not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+    except Exception as e:
+        return Response({
+            "detail": f"Error unregistering token: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def send_local_notification_api(request):
+    """Send local notification to current user (for testing with Expo Go)"""
+    title = request.data.get('title', 'Test Notification')
+    body = request.data.get('body', 'This is a test notification from LeftoverLink')
+    
+    try:
+        # For Expo Go, we'll just return success and let the frontend handle it
+        return Response({
+            "detail": "Local notification triggered successfully",
+            "title": title,
+            "body": body,
+            "data": {
+                "type": "test",
+                "timestamp": str(timezone.now())
+            }
+        }, status=status.HTTP_200_OK)
+        
+    except Exception as e:
+        return Response({
+            "detail": f"Error triggering local notification: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def send_test_notification_api(request):
+    """Send test notification to current user (for testing purposes)"""
+    if not request.user.is_staff:
+        return Response({
+            "detail": "Access denied. Only staff can send test notifications."
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    title = request.data.get('title', 'Test Notification')
+    body = request.data.get('body', 'This is a test notification from LeftoverLink')
+    
+    try:
+        result = fcm_service_v1.send_to_user(
+            user_id=request.user.id,
+            title=title,
+            body=body,
+            data={'type': 'test', 'timestamp': str(timezone.now())}
+        )
+        
+        if result:
+            return Response({
+                "detail": "Test notification sent successfully",
+                "result": result
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                "detail": "Failed to send test notification"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    except Exception as e:
+        return Response({
+            "detail": f"Error sending test notification: {str(e)}"
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
